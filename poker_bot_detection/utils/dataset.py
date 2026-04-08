@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 import json
 import gzip
 from utils.features import encode_chunk
@@ -42,9 +43,27 @@ class PokerDataset(Dataset):
         sequence = []
         for chunk in chunks:
             sequence.append(encode_chunk(chunk))
+        if not sequence:
+            # Guard against malformed empty chunks.
+            sequence.append(encode_chunk({}))
 
         x = torch.tensor(sequence, dtype=torch.float32)
 
         y = torch.tensor([label], dtype=torch.float32)
 
         return x, y
+
+
+def poker_collate_fn(batch):
+    """
+    Pad variable-length chunk sequences for GRU input.
+    Returns:
+        x_padded: [batch_size, max_seq_len, input_dim]
+        lengths: [batch_size]
+        y: [batch_size, 1]
+    """
+    sequences, labels = zip(*batch)
+    lengths = torch.tensor([seq.size(0) for seq in sequences], dtype=torch.long)
+    x_padded = pad_sequence(sequences, batch_first=True, padding_value=0.0)
+    y = torch.stack(labels, dim=0)
+    return x_padded, lengths, y

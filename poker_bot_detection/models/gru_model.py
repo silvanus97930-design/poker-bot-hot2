@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 class GRUClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.3):
@@ -24,12 +25,28 @@ class GRUClassifier(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
 
-    def forward(self, x):
-        gru_out, _ = self.gru(x)
+    def forward(self, x, lengths=None):
+        if lengths is not None:
+            packed = pack_padded_sequence(
+                x,
+                lengths.cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_out, _ = self.gru(packed)
+            gru_out, _ = pad_packed_sequence(packed_out, batch_first=True)
+        else:
+            gru_out, _ = self.gru(x)
+
         residual = self.residual_proj(x)
 
         out = self.layer_norm(gru_out + residual)
-        out = out[:, -1, :]
+        if lengths is not None:
+            # Select the last valid timestep for each sequence.
+            idx = (lengths - 1).clamp(min=0).to(x.device)
+            out = out[torch.arange(out.size(0), device=x.device), idx, :]
+        else:
+            out = out[:, -1, :]
 
         return self.fc(out)
 
