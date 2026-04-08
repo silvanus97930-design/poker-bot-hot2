@@ -11,7 +11,10 @@ PATIENCE = 7
 SEQ_LEN = 40
 
 # Public benchmark: one file with labeled_chunks[].split == "train" | "validation"
-DATA_PATH = "data/public_miner_benchmark.json.gz"
+
+# DATA_PATH = "data/public_miner_benchmark.json.gz"
+DATA_PATH = "data/public_miner_benchmark_seed101.json.gz"
+
 
 # If min(bot_count, human_count) / max(bot_count, human_count) < this, treat as imbalanced.
 BALANCE_IMBALANCE_RATIO_THRESHOLD = 0.35
