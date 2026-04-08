@@ -67,6 +67,64 @@ def _print_balance_report(split_name: str, stats: dict) -> None:
     )
 
 
+def _assert_dataset_split(dataset: PokerDataset, expected_split: str, name: str) -> None:
+    for i, entry in enumerate(dataset.labeled_chunks):
+        if not isinstance(entry, dict):
+            continue
+        split = entry.get("split")
+        if split is not None and split != expected_split:
+            raise ValueError(
+                f"{name} contains non-{expected_split} entry at index {i}: split={split}"
+            )
+
+
+def _run_pretrain_sanity_checks(
+    model: GRUClassifier,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    train_dataset: PokerDataset,
+    val_dataset: PokerDataset,
+    device: torch.device,
+) -> None:
+    _assert_dataset_split(train_dataset, "train", "train_dataset")
+    _assert_dataset_split(val_dataset, "validation", "val_dataset")
+    print("[sanity] split check passed (validation loader reads validation split only).")
+
+    sample_batch = next(iter(train_loader))
+    x, lengths, y = sample_batch
+    if x.dim() != 3:
+        raise ValueError(f"Expected x rank 3 [batch, seq, dim], got shape={tuple(x.shape)}")
+    if x.shape[-1] != config.INPUT_DIM:
+        raise ValueError(
+            f"Batch input_dim mismatch: x.shape[-1]={x.shape[-1]} vs config.INPUT_DIM={config.INPUT_DIM}"
+        )
+    if y.dim() != 2 or y.shape[-1] != 1:
+        raise ValueError(f"Expected y shape [batch, 1], got {tuple(y.shape)}")
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(x.to(device), lengths=lengths.to(device))
+    if logits.shape != y.shape:
+        raise ValueError(
+            f"Logits/label shape mismatch: logits={tuple(logits.shape)} vs y={tuple(y.shape)}"
+        )
+    print(
+        f"[sanity] one-batch forward passed | x={tuple(x.shape)} lengths={tuple(lengths.shape)} "
+        f"logits={tuple(logits.shape)} labels={tuple(y.shape)}"
+    )
+
+    val_batch = next(iter(val_loader))
+    vx, vl, vy = val_batch
+    if vx.shape[-1] != config.INPUT_DIM:
+        raise ValueError(
+            f"Validation input_dim mismatch: vx.shape[-1]={vx.shape[-1]} vs config.INPUT_DIM={config.INPUT_DIM}"
+        )
+    print(
+        f"[sanity] validation batch shape check passed | x={tuple(vx.shape)} "
+        f"lengths={tuple(vl.shape)} labels={tuple(vy.shape)}"
+    )
+
+
 def train():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -186,6 +244,14 @@ def train():
     )
 
     criterion = LabelSmoothingBCE(0.1, pos_weight=pos_weight_tensor)
+    _run_pretrain_sanity_checks(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        device=device,
+    )
 
     best_val_loss = float("inf")
     patience_counter = 0
