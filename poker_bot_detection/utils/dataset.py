@@ -4,10 +4,20 @@ from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 import json
 import gzip
-from utils.features import encode_chunk
+from pathlib import Path
+
+from .features import encode_chunk
+
 
 class PokerDataset(Dataset):
-    def __init__(self, file_path, split=None):
+    def __init__(
+        self,
+        file_path,
+        split=None,
+        feature_mean=None,
+        feature_std=None,
+        norm_eps=None,
+    ):
         if str(file_path).endswith(".gz"):
             with gzip.open(file_path, "rt", encoding="utf-8") as f:
                 self.data = json.load(f)
@@ -27,6 +37,18 @@ class PokerDataset(Dataset):
                 for chunk in self.labeled_chunks
                 if isinstance(chunk, dict) and chunk.get("split") == split
             ]
+
+        self._feature_mean = (
+            feature_mean.clone().detach().float().cpu()
+            if feature_mean is not None
+            else None
+        )
+        self._feature_std = (
+            feature_std.clone().detach().float().cpu()
+            if feature_std is not None
+            else None
+        )
+        self._norm_eps = float(norm_eps) if norm_eps is not None else None
 
     def __len__(self):
         return len(self.labeled_chunks)
@@ -50,6 +72,10 @@ class PokerDataset(Dataset):
 
         x = torch.tensor(sequence, dtype=torch.float32)
 
+        if self._feature_mean is not None and self._feature_std is not None:
+            eps = self._norm_eps if self._norm_eps is not None else 1e-8
+            x = (x - self._feature_mean) / (self._feature_std + eps)
+
         y = torch.tensor([label], dtype=torch.float32)
 
         return x, y
@@ -65,6 +91,63 @@ def _chunk_is_bot_and_hands(chunk_entry):
         is_bot = bool(hands and hands[0].get("label") == "bot")
     n_hands = len(hands) if isinstance(hands, list) else 0
     return is_bot, n_hands
+
+
+def apply_feature_normalization(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, eps: float) -> torch.Tensor:
+    """Apply train-fitted standardization to a hand sequence tensor [seq_len, dim] or batch."""
+    m = mean.to(device=x.device, dtype=x.dtype)
+    s = std.to(device=x.device, dtype=x.dtype)
+    return (x - m) / (s + eps)
+
+
+def fit_feature_normalization(dataset: PokerDataset, input_dim: int, eps: float = 1e-8):
+    """
+    Population mean and std per feature dimension over all *hand* vectors in the dataset.
+    Fit on train split only; pass resulting tensors to val PokerDataset.
+    """
+    sum_vec = torch.zeros(input_dim, dtype=torch.float64)
+    sumsq_vec = torch.zeros(input_dim, dtype=torch.float64)
+    n_rows = 0
+    for i in range(len(dataset)):
+        x, _ = dataset[i]
+        if x.numel() == 0:
+            continue
+        if x.shape[-1] != input_dim:
+            raise ValueError(
+                f"Feature dim {x.shape[-1]} != config INPUT_DIM {input_dim}; "
+                "update INPUT_DIM to match encode_hand() output size."
+            )
+        flat = x.reshape(-1, input_dim).double()
+        sum_vec += flat.sum(dim=0)
+        sumsq_vec += (flat * flat).sum(dim=0)
+        n_rows += flat.size(0)
+
+    if n_rows == 0:
+        mean = torch.zeros(input_dim, dtype=torch.float32)
+        std = torch.ones(input_dim, dtype=torch.float32)
+        return mean, std
+
+    mean = (sum_vec / n_rows).float()
+    var = (sumsq_vec / n_rows) - (sum_vec / n_rows) ** 2
+    std = torch.sqrt(torch.clamp(var.float(), min=0.0))
+    std = torch.where(std < eps, torch.ones_like(std), std)
+    return mean, std
+
+
+def save_feature_norm(path, mean: torch.Tensor, std: torch.Tensor, input_dim: int) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mean": mean.cpu(),
+        "std": std.cpu(),
+        "input_dim": int(input_dim),
+    }
+    torch.save(payload, path)
+
+
+def load_feature_norm(path):
+    payload = torch.load(path, map_location="cpu")
+    return payload["mean"], payload["std"], payload.get("input_dim")
 
 
 def compute_balance_stats(dataset: PokerDataset) -> dict:

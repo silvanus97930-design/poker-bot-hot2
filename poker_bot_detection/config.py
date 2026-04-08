@@ -17,3 +17,8 @@ DATA_PATH = "data/public_miner_benchmark.json.gz"
 BALANCE_IMBALANCE_RATIO_THRESHOLD = 0.35
 # "pos_weight" | "weighted_sampler" | "none" — "auto" picks pos_weight when imbalanced.
 BALANCE_STRATEGY = "auto"
+
+# Per-feature standardization (mean/std fit on train split only; same tensors for val).
+FEATURE_NORM_EPS = 1e-8
+# If empty, train.py writes next to train.py as feature_norm.pt
+FEATURE_NORM_PATH = ""

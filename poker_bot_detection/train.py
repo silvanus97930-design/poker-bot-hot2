@@ -1,4 +1,5 @@
 import torch
+from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from models.gru_model import GRUClassifier, LabelSmoothingBCE
 from utils.dataset import (
@@ -6,6 +7,8 @@ from utils.dataset import (
     poker_collate_fn,
     compute_balance_stats,
     train_sample_weights,
+    fit_feature_normalization,
+    save_feature_norm,
 )
 import config
 
@@ -24,8 +27,38 @@ def train():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_dataset = PokerDataset(config.DATA_PATH, split="train")
-    val_dataset = PokerDataset(config.DATA_PATH, split="validation")
+    norm_path = (
+        Path(config.FEATURE_NORM_PATH)
+        if getattr(config, "FEATURE_NORM_PATH", "")
+        else Path(__file__).resolve().parent / "feature_norm.pt"
+    )
+
+    train_for_norm = PokerDataset(config.DATA_PATH, split="train")
+    feature_mean, feature_std = fit_feature_normalization(
+        train_for_norm,
+        config.INPUT_DIM,
+        eps=config.FEATURE_NORM_EPS,
+    )
+    save_feature_norm(norm_path, feature_mean, feature_std, config.INPUT_DIM)
+    print(
+        f"[norm] fit on train only: saved mean/std shape={tuple(feature_mean.shape)} "
+        f"to {norm_path}"
+    )
+
+    train_dataset = PokerDataset(
+        config.DATA_PATH,
+        split="train",
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+        norm_eps=config.FEATURE_NORM_EPS,
+    )
+    val_dataset = PokerDataset(
+        config.DATA_PATH,
+        split="validation",
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+        norm_eps=config.FEATURE_NORM_EPS,
+    )
 
     train_stats = compute_balance_stats(train_dataset)
     val_stats = compute_balance_stats(val_dataset)
