@@ -1,20 +1,77 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from models.gru_model import GRUClassifier, LabelSmoothingBCE
-from utils.dataset import PokerDataset, poker_collate_fn
+from utils.dataset import (
+    PokerDataset,
+    poker_collate_fn,
+    compute_balance_stats,
+    train_sample_weights,
+)
 import config
+
+
+def _print_balance_report(split_name: str, stats: dict) -> None:
+    h = stats["hands_per_chunk"]
+    print(
+        f"[balance] {split_name}: chunks={stats['num_chunks']} "
+        f"bot={stats['bot_count']} human={stats['human_count']} "
+        f"minority_ratio={stats['minority_ratio']:.3f} "
+        f"hands/chunk avg={h['avg']:.1f} min={h['min']} max={h['max']}"
+    )
+
 
 def train():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_dataset = PokerDataset("data/train.json")
-    val_dataset = PokerDataset("data/val.json")
+    train_dataset = PokerDataset(config.DATA_PATH, split="train")
+    val_dataset = PokerDataset(config.DATA_PATH, split="validation")
+
+    train_stats = compute_balance_stats(train_dataset)
+    val_stats = compute_balance_stats(val_dataset)
+    _print_balance_report("train", train_stats)
+    _print_balance_report("val", val_stats)
+
+    imbalance_train = train_stats["minority_ratio"] < config.BALANCE_IMBALANCE_RATIO_THRESHOLD
+    strategy = config.BALANCE_STRATEGY
+    if strategy == "auto":
+        strategy = "pos_weight" if imbalance_train else "none"
+
+    pos_weight_tensor = None
+    train_sampler = None
+    shuffle_train = True
+
+    if imbalance_train and strategy == "pos_weight":
+        n_bot = train_stats["bot_count"]
+        n_human = train_stats["human_count"]
+        if n_bot > 0 and n_human > 0:
+            # Up-weight positive class (bot) when bots are rare; symmetric when humans are rare.
+            pos_weight_tensor = torch.tensor([n_human / n_bot], dtype=torch.float32)
+            print(
+                f"[balance] imbalanced (minority_ratio={train_stats['minority_ratio']:.3f} "
+                f"< {config.BALANCE_IMBALANCE_RATIO_THRESHOLD}): using pos_weight={pos_weight_tensor.item():.4f}"
+            )
+        else:
+            print("[balance] imbalanced but one class is empty; cannot set pos_weight.")
+    elif imbalance_train and strategy == "weighted_sampler":
+        train_sampler = WeightedRandomSampler(
+            train_sample_weights(train_dataset),
+            num_samples=len(train_dataset),
+            replacement=True,
+        )
+        shuffle_train = False
+        print(
+            f"[balance] imbalanced: using WeightedRandomSampler "
+            f"(minority_ratio={train_stats['minority_ratio']:.3f})"
+        )
+    elif imbalance_train:
+        print("[balance] imbalanced but BALANCE_STRATEGY=none; no reweighting applied.")
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
-        shuffle=True,
+        shuffle=shuffle_train,
+        sampler=train_sampler,
         collate_fn=poker_collate_fn,
     )
     val_loader = DataLoader(
@@ -36,7 +93,7 @@ def train():
         weight_decay=config.WEIGHT_DECAY
     )
 
-    criterion = LabelSmoothingBCE(0.1)
+    criterion = LabelSmoothingBCE(0.1, pos_weight=pos_weight_tensor)
 
     best_val_loss = float("inf")
     patience_counter = 0

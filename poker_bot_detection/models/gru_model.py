@@ -52,11 +52,21 @@ class GRUClassifier(nn.Module):
 
 
 class LabelSmoothingBCE(nn.Module):
-    def __init__(self, smoothing=0.1):
+    def __init__(self, smoothing=0.1, pos_weight=None):
         super().__init__()
         self.smoothing = smoothing
+        if pos_weight is not None:
+            self.register_buffer(
+                "pos_weight",
+                torch.as_tensor(pos_weight, dtype=torch.float32),
+            )
+        else:
+            self.pos_weight = None
 
     def forward(self, logits, targets):
         targets = targets.float()
         targets = targets * (1 - self.smoothing) + 0.5 * self.smoothing
-        return F.binary_cross_entropy_with_logits(logits, targets)
+        pw = None
+        if self.pos_weight is not None:
+            pw = self.pos_weight.to(device=logits.device, dtype=logits.dtype)
+        return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw)
