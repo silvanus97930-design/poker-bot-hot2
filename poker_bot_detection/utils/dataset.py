@@ -33,11 +33,11 @@ class PokerDataset(Dataset):
         chunk_entry = self.labeled_chunks[idx]
         if isinstance(chunk_entry, dict):
             chunks = chunk_entry.get("hands", [])
-            label = 1 if chunk_entry.get("is_bot", False) else 0
+            label = 1.0 if chunk_entry.get("is_bot", False) else 0.0
         else:
             # Backward compatibility with old list-based entries.
             chunks = chunk_entry
-            label = 1 if chunks and chunks[0].get("label") == "bot" else 0
+            label = 1.0 if chunks and chunks[0].get("label") == "bot" else 0.0
 
         sequence = []
         for chunk in chunks:
