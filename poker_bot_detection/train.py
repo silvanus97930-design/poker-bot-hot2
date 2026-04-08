@@ -1,7 +1,10 @@
 import torch
 from pathlib import Path
+import gzip
+import json
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from models.gru_model import GRUClassifier, LabelSmoothingBCE
+from utils.features import FEATURE_NAMES, FEATURE_SCHEMA_VERSION
 from utils.dataset import (
     PokerDataset,
     poker_collate_fn,
@@ -11,6 +14,47 @@ from utils.dataset import (
     save_feature_norm,
 )
 import config
+
+
+def _load_dataset_hash(data_path: str) -> str:
+    path = Path(data_path)
+    if str(path).endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            payload = json.load(f)
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    return str(payload.get("dataset_hash", ""))
+
+
+def _save_preprocessing_artifact(
+    artifact_path: Path,
+    *,
+    data_path: str,
+    norm_path: Path,
+    input_dim: int,
+) -> None:
+    dataset_hash = _load_dataset_hash(data_path)
+    artifact = {
+        "artifact_version": 1,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_names": list(FEATURE_NAMES),
+        "input_dim": int(input_dim),
+        "normalization": {
+            "type": "standardization",
+            "fit_split": "train",
+            "norm_file": str(norm_path),
+            "eps": float(config.FEATURE_NORM_EPS),
+        },
+        "dataset": {
+            "data_path": str(data_path),
+            "dataset_hash": dataset_hash,
+        },
+    }
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(artifact_path, "w", encoding="utf-8") as f:
+        json.dump(artifact, f, indent=2, ensure_ascii=True)
+    print(f"[artifact] saved preprocessing artifact to {artifact_path}")
 
 
 def _print_balance_report(split_name: str, stats: dict) -> None:
@@ -32,6 +76,11 @@ def train():
         if getattr(config, "FEATURE_NORM_PATH", "")
         else Path(__file__).resolve().parent / "feature_norm.pt"
     )
+    artifact_path = (
+        Path(config.PREPROCESSING_ARTIFACT_PATH)
+        if getattr(config, "PREPROCESSING_ARTIFACT_PATH", "")
+        else Path(__file__).resolve().parent / "preprocessing_artifact.json"
+    )
 
     train_for_norm = PokerDataset(config.DATA_PATH, split="train")
     feature_mean, feature_std = fit_feature_normalization(
@@ -43,6 +92,16 @@ def train():
     print(
         f"[norm] fit on train only: saved mean/std shape={tuple(feature_mean.shape)} "
         f"to {norm_path}"
+    )
+    if len(FEATURE_NAMES) != config.INPUT_DIM:
+        raise ValueError(
+            f"FEATURE_NAMES has {len(FEATURE_NAMES)} entries but INPUT_DIM={config.INPUT_DIM}."
+        )
+    _save_preprocessing_artifact(
+        artifact_path,
+        data_path=config.DATA_PATH,
+        norm_path=norm_path,
+        input_dim=config.INPUT_DIM,
     )
 
     train_dataset = PokerDataset(

@@ -22,3 +22,7 @@ BALANCE_STRATEGY = "auto"
 FEATURE_NORM_EPS = 1e-8
 # If empty, train.py writes next to train.py as feature_norm.pt
 FEATURE_NORM_PATH = ""
+
+# Reproducibility artifact with schema/version, dataset hash, and norm metadata.
+# If empty, train.py writes next to train.py as preprocessing_artifact.json
+PREPROCESSING_ARTIFACT_PATH = ""

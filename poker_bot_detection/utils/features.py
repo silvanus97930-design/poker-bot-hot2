@@ -2,6 +2,40 @@ import numpy as np
 
 _STREETS = ("preflop", "flop", "turn", "river")
 _ACTION_TYPES = ("call", "check", "raise", "fold", "bet")
+FEATURE_SCHEMA_VERSION = "v1"
+FEATURE_NAMES = (
+    "meta_max_seats",
+    "meta_sb",
+    "meta_bb",
+    "meta_ante",
+    "meta_blind_ratio_sb_over_bb",
+    "meta_ante_over_bb",
+    "players_count",
+    "players_stack_mean",
+    "players_stack_std",
+    "players_stack_min",
+    "players_stack_max",
+    "actions_count",
+    "actions_ratio_call",
+    "actions_ratio_check",
+    "actions_ratio_raise",
+    "actions_ratio_fold",
+    "actions_ratio_bet",
+    "actions_amount_bb_mean",
+    "actions_amount_bb_std",
+    "actions_amount_bb_max",
+    "actions_pot_before_mean",
+    "actions_pot_before_max",
+    "actions_pot_after_mean",
+    "actions_pot_after_max",
+    "actions_actor_seat_mean",
+    "actions_actor_seat_std",
+    "actions_actor_seat_max",
+    "street_ratio_preflop",
+    "street_ratio_flop",
+    "street_ratio_turn",
+    "street_ratio_river",
+)
 
 
 def _safe_float(value, default=0.0):
