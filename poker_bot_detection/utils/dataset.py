@@ -5,7 +5,7 @@ import gzip
 from utils.features import encode_chunk
 
 class PokerDataset(Dataset):
-    def __init__(self, file_path):
+    def __init__(self, file_path, split=None):
         if str(file_path).endswith(".gz"):
             with gzip.open(file_path, "rt", encoding="utf-8") as f:
                 self.data = json.load(f)
@@ -18,12 +18,26 @@ class PokerDataset(Dataset):
         # Keep backward compatibility with the older "chunks" format.
         self.labeled_chunks = self.data.get("labeled_chunks", self.data.get("chunks", []))
 
+        # Use benchmark-provided deterministic split when available.
+        if split is not None:
+            self.labeled_chunks = [
+                chunk
+                for chunk in self.labeled_chunks
+                if isinstance(chunk, dict) and chunk.get("split") == split
+            ]
+
     def __len__(self):
         return len(self.labeled_chunks)
 
     def __getitem__(self, idx):
         chunk_entry = self.labeled_chunks[idx]
-        chunks = chunk_entry.get("hands", chunk_entry)
+        if isinstance(chunk_entry, dict):
+            chunks = chunk_entry.get("hands", [])
+            label = 1 if chunk_entry.get("is_bot", False) else 0
+        else:
+            # Backward compatibility with old list-based entries.
+            chunks = chunk_entry
+            label = 1 if chunks and chunks[0].get("label") == "bot" else 0
 
         sequence = []
         for chunk in chunks:
@@ -31,7 +45,6 @@ class PokerDataset(Dataset):
 
         x = torch.tensor(sequence, dtype=torch.float32)
 
-        label = 1 if chunk_entry.get("is_bot", False) else 0
         y = torch.tensor([label], dtype=torch.float32)
 
         return x, y
