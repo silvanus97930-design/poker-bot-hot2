@@ -1,13 +1,15 @@
-"""Reference Poker44 miner with simple chunk-level behavioral heuristics."""
+"""Reference Poker44 miner with chunk-level GRU+Transformer inference."""
 
 # from __future__ import annotations
 
 import time
-from collections import Counter
+import os
 from pathlib import Path
 from typing import Tuple
 
 import bittensor as bt
+import torch
+import numpy as np
 
 from poker44.base.miner import BaseMinerNeuron
 from poker44.utils.model_manifest import (
@@ -16,39 +18,48 @@ from poker44.utils.model_manifest import (
     manifest_digest,
 )
 from poker44.validator.synapse import DetectionSynapse
+from poker_bot_detection.models.gru_model import GRUTransformerClassifier
+import poker_bot_detection.config as det_config
+from poker_bot_detection.utils.features import encode_hand
+from poker_bot_detection.utils.dataset import load_feature_norm, apply_feature_normalization
 
 
 class Miner(BaseMinerNeuron):
-    """
-    Reference heuristic miner.
-
-    It aggregates simple behavior signals over each chunk and returns a bot-risk
-    score per chunk. The goal is not SOTA accuracy, but a deterministic and
-    explainable baseline that is meaningfully better than random.
-    """
+    """GRU+Transformer miner that returns one bot-risk score per chunk."""
 
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
-        bt.logging.info("🤖 Heuristic Poker44 Miner started")
+        bt.logging.info("🤖 GRU+Transformer Poker44 Miner started")
         repo_root = Path(__file__).resolve().parents[1]
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_path = repo_root / "best_model.pt"
+        self.norm_path = repo_root / "poker_bot_detection" / "feature_norm.pt"
+        self.decision_threshold = float(
+            os.getenv(
+                "MODEL_DECISION_THRESHOLD",
+                getattr(det_config, "INFERENCE_THRESHOLD", 0.5),
+            )
+        )
+        self.model = self._load_model()
+        self.feature_mean, self.feature_std = self._load_normalization()
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=[Path(__file__).resolve()],
             defaults={
-                "model_name": "poker44-reference-heuristic",
-                "model_version": "1",
-                "framework": "python-heuristic",
+                "model_name": "poker44-gru-transformer-strong-seed44",
+                "model_version": "2",
+                "framework": "pytorch-gru-transformer",
                 "license": "MIT",
                 "repo_url": "https://github.com/Poker44/Poker44-subnet",
-                "notes": "Reference heuristic miner shipped with the Poker44 subnet.",
+                "notes": "GRU+Transformer miner using strong seed44 checkpoint and train-fit normalization.",
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (
-                    "Reference heuristic miner. No training step. Uses only runtime chunk features."
+                    "Trained on strong seed44 public benchmark chunks using GRU+Transformer sequence model."
                 ),
-                "training_data_sources": ["none"],
+                "training_data_sources": ["data/public_miner_benchmark_strong_seed44.json.gz"],
                 "private_data_attestation": (
-                    "This reference miner does not train on validator-private human data."
+                    "This miner is trained only on public benchmark data, not validator-private human data."
                 ),
             },
         )
@@ -84,6 +95,10 @@ class Miner(BaseMinerNeuron):
             f"inference_mode={self.model_manifest.get('inference_mode', '')}"
         )
         bt.logging.info(
+            f"Inference threshold={self.decision_threshold:.3f} "
+            "(override with MODEL_DECISION_THRESHOLD env var)"
+        )
+        bt.logging.info(
             "Miner prep tooling available | "
             f"benchmark_doc={repo_root / 'docs' / 'public-benchmark.md'} "
             f"miner_doc={repo_root / 'docs' / 'miner.md'} "
@@ -98,68 +113,70 @@ class Miner(BaseMinerNeuron):
             "while Poker44 moves toward more dynamic evaluation."
         )
 
+    def _load_model(self) -> GRUTransformerClassifier:
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Missing model checkpoint: {self.model_path}")
+        model = GRUTransformerClassifier(
+            input_dim=det_config.INPUT_DIM,
+            hidden_dim=det_config.HIDDEN_DIM,
+            gru_layers=det_config.NUM_LAYERS,
+            tf_layers=getattr(det_config, "TF_LAYERS", 2),
+            nhead=getattr(det_config, "NHEAD", 4),
+            ff_mult=getattr(det_config, "FF_MULT", 4),
+            dropout=det_config.DROPOUT,
+            max_len=getattr(det_config, "MAX_SEQ_LEN", 2048),
+            bidirectional_gru=getattr(det_config, "BIDIRECTIONAL_GRU", True),
+            use_attention_pool=getattr(det_config, "USE_ATTENTION_POOL", True),
+        ).to(self.device)
+        state = torch.load(self.model_path, map_location=self.device)
+        model.load_state_dict(state)
+        model.eval()
+        bt.logging.info(f"Loaded GRU+Transformer checkpoint from {self.model_path}")
+        return model
+
+    def _load_normalization(self):
+        if not self.norm_path.exists():
+            raise FileNotFoundError(f"Missing feature norm file: {self.norm_path}")
+        mean, std, input_dim = load_feature_norm(self.norm_path)
+        if input_dim is not None and int(input_dim) != int(det_config.INPUT_DIM):
+            raise ValueError(
+                f"Normalization input_dim mismatch: norm={input_dim}, config={det_config.INPUT_DIM}"
+            )
+        bt.logging.info(f"Loaded feature normalization from {self.norm_path}")
+        return mean.to(self.device), std.to(self.device)
+
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
-        """Assign one deterministic bot-risk score per chunk."""
+        """Assign one GRU+Transformer risk score per chunk."""
         chunks = synapse.chunks or []
         scores = [self.score_chunk(chunk) for chunk in chunks]
         synapse.risk_scores = scores
-        synapse.predictions = [s >= 0.5 for s in scores]
+        synapse.predictions = [s >= self.decision_threshold for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
-        bt.logging.info(f"Miner Predctions: {synapse.predictions}")
-        bt.logging.info(f"Scored {len(chunks)} chunks with heuristic risks.")
+        bt.logging.info(f"Miner Predictions: {synapse.predictions}")
+        bt.logging.info(f"Scored {len(chunks)} chunks with model risks.")
         return synapse
 
     @staticmethod
     def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, value))
 
-    @classmethod
-    def _score_hand(cls, hand: dict) -> float:
-        actions = hand.get("actions") or []
-        players = hand.get("players") or []
-        streets = hand.get("streets") or []
-        outcome = hand.get("outcome") or {}
-
-        action_counts = Counter(action.get("action_type") for action in actions)
-        meaningful_actions = max(
-            1,
-            sum(
-                action_counts.get(kind, 0)
-                for kind in ("call", "check", "bet", "raise", "fold")
-            ),
-        )
-
-        call_ratio = action_counts.get("call", 0) / meaningful_actions
-        check_ratio = action_counts.get("check", 0) / meaningful_actions
-        fold_ratio = action_counts.get("fold", 0) / meaningful_actions
-        raise_ratio = action_counts.get("raise", 0) / meaningful_actions
-        street_depth = len(streets) / 3.0
-        showdown_flag = 1.0 if outcome.get("showdown") else 0.0
-
-        player_count_signal = 0.0
-        if players:
-            player_count_signal = (6 - min(len(players), 6)) / 4.0
-
-        score = 0.0
-        score += 0.32 * street_depth
-        score += 0.22 * showdown_flag
-        score += 0.18 * cls._clamp01(call_ratio / 0.35)
-        score += 0.12 * cls._clamp01(check_ratio / 0.30)
-        score += 0.08 * cls._clamp01(player_count_signal)
-        score -= 0.18 * cls._clamp01(fold_ratio / 0.55)
-        score -= 0.10 * cls._clamp01(raise_ratio / 0.20)
-
-        return cls._clamp01(score)
-
-    @classmethod
-    def score_chunk(cls, chunk: list[dict]) -> float:
+    def score_chunk(self, chunk: list[dict]) -> float:
         if not chunk:
             return 0.5
 
-        hand_scores = [cls._score_hand(hand) for hand in chunk]
-        avg_score = sum(hand_scores) / len(hand_scores)
-
-        return round(cls._clamp01(avg_score), 6)
+        seq = np.array([encode_hand(hand) for hand in chunk], dtype=np.float32)
+        x = torch.tensor(seq, dtype=torch.float32, device=self.device).unsqueeze(0)
+        lengths = torch.tensor([x.shape[1]], dtype=torch.long, device=self.device)
+        x = apply_feature_normalization(
+            x,
+            self.feature_mean,
+            self.feature_std,
+            det_config.FEATURE_NORM_EPS,
+        )
+        with torch.no_grad():
+            logits = self.model(x, lengths=lengths)
+            prob = torch.sigmoid(logits).item()
+        return round(self._clamp01(prob), 6)
 
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
         """Determine whether to blacklist incoming requests."""

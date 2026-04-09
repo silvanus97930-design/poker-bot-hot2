@@ -1,9 +1,11 @@
 import torch
+import torch.nn as nn
+from torch.amp import GradScaler, autocast
 from pathlib import Path
 import gzip
 import json
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from models.gru_model import GRUClassifier, LabelSmoothingBCE
+from models.gru_model import GRUTransformerClassifier, LabelSmoothingBCE
 from utils.features import FEATURE_NAMES, FEATURE_SCHEMA_VERSION
 from utils.dataset import (
     PokerDataset,
@@ -14,6 +16,11 @@ from utils.dataset import (
     save_feature_norm,
 )
 import config
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 
 def _load_dataset_hash(data_path: str) -> str:
@@ -79,7 +86,7 @@ def _assert_dataset_split(dataset: PokerDataset, expected_split: str, name: str)
 
 
 def _run_pretrain_sanity_checks(
-    model: GRUClassifier,
+    model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
     train_dataset: PokerDataset,
@@ -125,9 +132,37 @@ def _run_pretrain_sanity_checks(
     )
 
 
+def _resolve_data_path() -> str:
+    return str(getattr(config, "DATA_PATH_OVERRIDE", "") or config.DATA_PATH)
+
+
+def _progress_iter(loader, *, desc: str, leave: bool):
+    if tqdm is None:
+        return loader
+    return tqdm(loader, desc=desc, leave=leave, dynamic_ncols=True)
+
+
 def train():
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this training run, but no GPU was detected.")
+    device = torch.device("cuda")
+    gpu_name = torch.cuda.get_device_name(0)
+    if getattr(config, "REQUIRE_RTX_3090", True) and "3090" not in gpu_name:
+        raise RuntimeError(
+            f"Expected RTX 3090 but detected '{gpu_name}'. "
+            "Set REQUIRE_RTX_3090=False in config to bypass."
+        )
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    print(f"[device] using GPU: {gpu_name}")
+    print(
+        f"[device] tf32 matmul={torch.backends.cuda.matmul.allow_tf32} "
+        f"cudnn_tf32={torch.backends.cudnn.allow_tf32}"
+    )
+
+    data_path = _resolve_data_path()
 
     norm_path = (
         Path(config.FEATURE_NORM_PATH)
@@ -140,7 +175,7 @@ def train():
         else Path(__file__).resolve().parent / "preprocessing_artifact.json"
     )
 
-    train_for_norm = PokerDataset(config.DATA_PATH, split="train")
+    train_for_norm = PokerDataset(data_path, split="train")
     feature_mean, feature_std = fit_feature_normalization(
         train_for_norm,
         config.INPUT_DIM,
@@ -157,20 +192,20 @@ def train():
         )
     _save_preprocessing_artifact(
         artifact_path,
-        data_path=config.DATA_PATH,
+        data_path=data_path,
         norm_path=norm_path,
         input_dim=config.INPUT_DIM,
     )
 
     train_dataset = PokerDataset(
-        config.DATA_PATH,
+        data_path,
         split="train",
         feature_mean=feature_mean,
         feature_std=feature_std,
         norm_eps=config.FEATURE_NORM_EPS,
     )
     val_dataset = PokerDataset(
-        config.DATA_PATH,
+        data_path,
         split="validation",
         feature_mean=feature_mean,
         feature_std=feature_std,
@@ -217,24 +252,51 @@ def train():
     elif imbalance_train:
         print("[balance] imbalanced but BALANCE_STRATEGY=none; no reweighting applied.")
 
+    num_workers = int(getattr(config, "NUM_WORKERS", 8))
+    pin_memory = bool(getattr(config, "PIN_MEMORY", True))
+    persistent_workers = bool(getattr(config, "PERSISTENT_WORKERS", True)) and num_workers > 0
+    prefetch_factor = int(getattr(config, "PREFETCH_FACTOR", 2))
+
+    train_loader_kwargs = {
+        "batch_size": config.BATCH_SIZE,
+        "shuffle": shuffle_train,
+        "sampler": train_sampler,
+        "collate_fn": poker_collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    val_loader_kwargs = {
+        "batch_size": config.BATCH_SIZE,
+        "collate_fn": poker_collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if num_workers > 0:
+        train_loader_kwargs["prefetch_factor"] = prefetch_factor
+        val_loader_kwargs["prefetch_factor"] = prefetch_factor
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=shuffle_train,
-        sampler=train_sampler,
-        collate_fn=poker_collate_fn,
+        **train_loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.BATCH_SIZE,
-        collate_fn=poker_collate_fn,
+        **val_loader_kwargs,
     )
 
-    model = GRUClassifier(
+    model = GRUTransformerClassifier(
         input_dim=config.INPUT_DIM,
         hidden_dim=config.HIDDEN_DIM,
-        num_layers=config.NUM_LAYERS,
-        dropout=config.DROPOUT
+        gru_layers=config.NUM_LAYERS,
+        tf_layers=getattr(config, "TF_LAYERS", 2),
+        nhead=getattr(config, "NHEAD", 4),
+        ff_mult=getattr(config, "FF_MULT", 4),
+        dropout=config.DROPOUT,
+        max_len=getattr(config, "MAX_SEQ_LEN", 2048),
+        bidirectional_gru=getattr(config, "BIDIRECTIONAL_GRU", True),
+        use_attention_pool=getattr(config, "USE_ATTENTION_POOL", True),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -242,8 +304,20 @@ def train():
         lr=config.LR,
         weight_decay=config.WEIGHT_DECAY
     )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=max(2, int(config.PATIENCE // 3)),
+        min_lr=1e-6,
+    )
 
-    criterion = LabelSmoothingBCE(0.1, pos_weight=pos_weight_tensor)
+    criterion = LabelSmoothingBCE(
+        getattr(config, "LABEL_SMOOTHING", 0.05),
+        pos_weight=pos_weight_tensor,
+    )
+    amp_enabled = bool(getattr(config, "AMP_ENABLED", True))
+    scaler = GradScaler("cuda", enabled=amp_enabled)
     _run_pretrain_sanity_checks(
         model=model,
         train_loader=train_loader,
@@ -259,28 +333,67 @@ def train():
     for epoch in range(config.EPOCHS):
 
         model.train()
-        for x, lengths, y in train_loader:
-            x, lengths, y = x.to(device), lengths.to(device), y.to(device)
+        train_loss_sum = 0.0
+        train_batches = 0
+        train_iter = _progress_iter(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{config.EPOCHS} [train]",
+            leave=False,
+        )
+        for x, lengths, y in train_iter:
+            x = x.to(device, non_blocking=True)
+            lengths = lengths.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            logits = model(x, lengths=lengths)
-            loss = criterion(logits, y)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast("cuda", enabled=amp_enabled):
+                logits = model(x, lengths=lengths)
+                loss = criterion(logits, y)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                float(getattr(config, "GRAD_CLIP_NORM", 1.0)),
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            train_loss_sum += float(loss.item())
+            train_batches += 1
+            if tqdm is not None:
+                train_iter.set_postfix(loss=f"{loss.item():.4f}")
 
         # Validation
         model.eval()
-        val_loss = 0
+        val_loss_sum = 0.0
+        val_batches = 0
 
+        val_iter = _progress_iter(
+            val_loader,
+            desc=f"Epoch {epoch + 1}/{config.EPOCHS} [val]",
+            leave=False,
+        )
         with torch.no_grad():
-            for x, lengths, y in val_loader:
-                x, lengths, y = x.to(device), lengths.to(device), y.to(device)
-                logits = model(x, lengths=lengths)
-                val_loss += criterion(logits, y).item()
+            for x, lengths, y in val_iter:
+                x = x.to(device, non_blocking=True)
+                lengths = lengths.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                with autocast("cuda", enabled=amp_enabled):
+                    logits = model(x, lengths=lengths)
+                    loss = criterion(logits, y)
+                val_loss_sum += float(loss.item())
+                val_batches += 1
+                if tqdm is not None:
+                    val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-        print(f"Epoch {epoch}, Val Loss: {val_loss:.4f}")
+        train_loss = train_loss_sum / max(1, train_batches)
+        val_loss = val_loss_sum / max(1, val_batches)
+        print(
+            f"Epoch {epoch + 1}/{config.EPOCHS} | "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"best_val={best_val_loss:.4f} lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+        scheduler.step(val_loss)
 
         # Early stopping
         if val_loss < best_val_loss:

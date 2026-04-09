@@ -194,32 +194,33 @@ class BaseMinerNeuron(BaseNeuron):
         bt.logging.info(f"Miner starting at block: {self.block}")
 
         # This loop maintains the miner's operations until intentionally stopped.
-        try:
-            while not self.should_exit:
+        # Keep running on transient RPC/sync failures so the axon thread model stays healthy
+        # and metagraph refresh retries instead of exiting the background thread.
+        while not self.should_exit:
+            try:
                 while (
                     self.block - self.metagraph.last_update[self.uid]
                     < self.config.neuron.epoch_length
                 ):
-                    # Wait before checking again.
                     time.sleep(1)
-
-                    # Check if we should exit.
                     if self.should_exit:
                         break
 
-                # Sync metagraph and potentially set weights.
+                if self.should_exit:
+                    break
+
                 self.sync()
                 self.step += 1
-
-        # If someone intentionally stops the miner, it'll safely terminate operations.
-        except KeyboardInterrupt:
-            self.axon.stop()
-            bt.logging.success("Miner killed by keyboard interrupt.")
-            exit()
-
-        # In case of unforeseen errors, the miner will log the error and continue operations.
-        except Exception as e:
-            bt.logging.error(traceback.format_exc())
+            except KeyboardInterrupt:
+                self.axon.stop()
+                bt.logging.success("Miner killed by keyboard interrupt.")
+                exit()
+            except Exception:
+                bt.logging.error(
+                    "Miner epoch loop error (axon keeps serving; will retry sync):\n"
+                    + traceback.format_exc()
+                )
+                time.sleep(10)
 
     def run_in_background_thread(self):
         """

@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from hands_generator.bot_hands.bot_archetypes import all_training_archetype_profiles
 from hands_generator.bot_hands.sandbox_poker_bot import SandboxPokerBot, BotProfile, GameState, LegalActions, Street, ActionType, BotDecision
 from poker44.core.hand_json import V0_JSON_HAND
 
@@ -108,6 +109,13 @@ def _mutate_profile(profile: BotProfile, rng: random.Random) -> BotProfile:
         ),
         trap_frequency=_clamp_float(
             profile.trap_frequency + rng.uniform(-0.20, 0.20), -1.0, 1.0
+        ),
+        random_mode=profile.random_mode,
+        decision_noise=_clamp_float(
+            profile.decision_noise + rng.uniform(-0.02, 0.02), 0.0, 1.0
+        ),
+        pattern_repeat_probability=_clamp_float(
+            profile.pattern_repeat_probability + rng.uniform(-0.08, 0.08), 0.0, 1.0
         ),
     )
 
@@ -918,14 +926,8 @@ class PokerHandGenerator:
         return hand
 
 def main():
-    profiles = [
-        BotProfile(name="tight_aggressive", tightness=0.70, aggression=0.75, bluff_freq=0.05),
-        BotProfile(name="loose_aggressive", tightness=0.40, aggression=0.80, bluff_freq=0.12),
-        BotProfile(name="tight_passive", tightness=0.68, aggression=0.35, bluff_freq=0.03),
-        BotProfile(name="loose_passive", tightness=0.42, aggression=0.30, bluff_freq=0.08),
-        BotProfile(name="balanced", tightness=0.55, aggression=0.55, bluff_freq=0.08),
-    ]
-    
+    profiles = all_training_archetype_profiles()
+
     generator = PokerHandGenerator()
     output_path = Path(__file__).with_name("bot_hands.json")
 

@@ -129,6 +129,11 @@ class BotProfile:
     postflop_continue_bias: float = 0.0   # lower -> fold/check more often after flop
     trap_frequency: float = 0.0           # lower -> fewer slowplays/call-downs with strong hands
 
+    # Extended archetype controls (training-data diversity)
+    random_mode: bool = False             # if True, pick uniformly among legal actions
+    decision_noise: float = 0.0           # 0..1: chance to replace heuristic pick with random legal
+    pattern_repeat_probability: float = 0.0  # 0..1: repeat last action type when still legal (per-hand)
+
 
 @dataclass
 class BotDecision:
@@ -151,6 +156,8 @@ class SandboxPokerBot:
     def __init__(self, profile: BotProfile, rng_seed: Optional[int] = None):
         self.profile = profile
         self.rng = random.Random(rng_seed)
+        self._hand_ctx_id: Optional[str] = None
+        self._last_action: Optional[ActionType] = None
         self.session_stats = {
             "hands_seen": 0,
             "hands_played": 0,
@@ -222,7 +229,19 @@ class SandboxPokerBot:
         Main decision entrypoint.
         """
         self.session_stats["hands_seen"] += 1
-        
+        if self._hand_ctx_id != state.hand_id:
+            self._hand_ctx_id = state.hand_id
+            self._last_action = None
+
+        if self.profile.random_mode:
+            decision = self._random_legal_decision(state, legal)
+            decision.meta = decision.meta or {}
+            decision.meta.update({"reason": "random_mode", "profile": self.profile.name})
+            if decision.action in (ActionType.BET, ActionType.RAISE):
+                self.session_stats["aggressive_actions"] += 1
+            self._last_action = decision.action
+            return decision
+
         # Try to get CSV-based strength first (Method I)
         if state.hole_cards:
             csv_strength = self._get_hand_strength_from_csv(state.hole_cards)
@@ -242,6 +261,24 @@ class SandboxPokerBot:
         else:
             decision = self._decide_postflop(state, legal, strength_bucket, pos_factor, pot_odds)
 
+        noise = max(0.0, min(1.0, float(self.profile.decision_noise)))
+        if noise > 0 and self.rng.random() < noise:
+            decision = self._random_legal_decision(state, legal)
+            decision.meta = decision.meta or {}
+            decision.meta["reason"] = (decision.meta.get("reason") or "") + "|decision_noise"
+
+        patt = max(0.0, min(1.0, float(self.profile.pattern_repeat_probability)))
+        if (
+            patt > 0
+            and self._last_action is not None
+            and self.rng.random() < patt
+        ):
+            repeated = self._try_repeat_last_action(state, legal)
+            if repeated is not None:
+                decision = repeated
+                decision.meta = decision.meta or {}
+                decision.meta["reason"] = (decision.meta.get("reason") or "") + "|pattern_repeat"
+
         # Add meta for logging/dataset
         decision.meta = decision.meta or {}
         decision.meta.update({
@@ -259,7 +296,8 @@ class SandboxPokerBot:
         # Update session stats
         if decision.action in (ActionType.BET, ActionType.RAISE):
             self.session_stats["aggressive_actions"] += 1
-            
+
+        self._last_action = decision.action
         return decision
 
     def export_session_stats(self) -> Dict[str, Any]:
@@ -267,6 +305,44 @@ class SandboxPokerBot:
 
 
     # --------- Core Logic (IF-based) ---------
+
+    def _random_legal_decision(self, state: GameState, legal: LegalActions) -> BotDecision:
+        choices: List[Tuple[ActionType, int]] = []
+        if legal.can_fold:
+            choices.append((ActionType.FOLD, 0))
+        if legal.can_check:
+            choices.append((ActionType.CHECK, 0))
+        if legal.can_call:
+            choices.append((ActionType.CALL, legal.call_amount))
+        if legal.can_bet and legal.max_bet >= legal.min_bet:
+            amt = self.rng.randint(legal.min_bet, legal.max_bet)
+            choices.append((ActionType.BET, amt))
+        if legal.can_raise and legal.max_raise >= legal.min_raise:
+            amt = self.rng.randint(legal.min_raise, legal.max_raise)
+            choices.append((ActionType.RAISE, amt))
+        if not choices:
+            return BotDecision(ActionType.FOLD, 0, {"reason": "random_no_legal"})
+        act, amt = self.rng.choice(choices)
+        return BotDecision(act, amt, {"reason": "random_legal"})
+
+    def _try_repeat_last_action(
+        self, state: GameState, legal: LegalActions
+    ) -> Optional[BotDecision]:
+        la = self._last_action
+        if la == ActionType.FOLD and legal.can_fold:
+            return BotDecision(ActionType.FOLD, 0, {"reason": "pattern_fold"})
+        if la == ActionType.CHECK and legal.can_check:
+            return BotDecision(ActionType.CHECK, 0, {"reason": "pattern_check"})
+        if la == ActionType.CALL and legal.can_call:
+            return BotDecision(ActionType.CALL, legal.call_amount, {"reason": "pattern_call"})
+        if la in (ActionType.BET, ActionType.RAISE):
+            if legal.can_bet:
+                amt = self._size_bet(state, legal, small=False)
+                return BotDecision(ActionType.BET, amt, {"reason": "pattern_bet"})
+            if legal.can_raise:
+                amt = self._size_raise(state, legal, large=False)
+                return BotDecision(ActionType.RAISE, amt, {"reason": "pattern_raise"})
+        return None
 
     def _decide_preflop(
         self,

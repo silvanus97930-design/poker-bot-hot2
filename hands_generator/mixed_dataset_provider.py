@@ -529,6 +529,11 @@ def _profiles_for_target_signature(
                     -1.0,
                     1.0,
                 ),
+                random_mode=profile.random_mode,
+                decision_noise=_clamp_profile_value(profile.decision_noise, 0.0, 1.0),
+                pattern_repeat_probability=_clamp_profile_value(
+                    profile.pattern_repeat_probability, 0.0, 1.0
+                ),
             )
         )
     return tuned_profiles

@@ -20,6 +20,7 @@ import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
+from hands_generator.bot_hands.bot_archetypes import all_training_archetype_profiles
 from hands_generator.bot_hands.generate_poker_data import (
     PokerHandGenerator,
     TableSession,
@@ -47,53 +48,8 @@ def load_human_hands(path: Path = HUMAN_HANDS_PATH) -> List[Dict[str, Any]]:
 
 
 def _default_bot_profiles() -> List[BotProfile]:
-    return [
-        BotProfile(
-            name="balanced",
-            tightness=0.58,
-            aggression=0.58,
-            bluff_freq=0.04,
-            preflop_defend_bias=-0.10,
-            postflop_continue_bias=-0.08,
-            trap_frequency=-0.10,
-        ),
-        BotProfile(
-            name="tight_aggressive",
-            tightness=0.66,
-            aggression=0.74,
-            bluff_freq=0.04,
-            preflop_defend_bias=-0.18,
-            postflop_continue_bias=-0.14,
-            trap_frequency=-0.06,
-        ),
-        BotProfile(
-            name="loose_aggressive",
-            tightness=0.48,
-            aggression=0.74,
-            bluff_freq=0.07,
-            preflop_defend_bias=0.10,
-            postflop_continue_bias=0.02,
-            trap_frequency=0.00,
-        ),
-        BotProfile(
-            name="tight_passive",
-            tightness=0.64,
-            aggression=0.42,
-            bluff_freq=0.02,
-            preflop_defend_bias=-0.24,
-            postflop_continue_bias=-0.20,
-            trap_frequency=-0.18,
-        ),
-        BotProfile(
-            name="loose_passive",
-            tightness=0.50,
-            aggression=0.40,
-            bluff_freq=0.04,
-            preflop_defend_bias=-0.06,
-            postflop_continue_bias=-0.10,
-            trap_frequency=-0.12,
-        ),
-    ]
+    """Thirteen named training archetypes (see bot_archetypes.TRAINING_ARCHETYPE_NAMES)."""
+    return all_training_archetype_profiles()
 
 
 def sample_human_chunk(

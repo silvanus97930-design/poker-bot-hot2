@@ -140,8 +140,21 @@ class BaseNeuron(ABC):
         """
         Wrapper for synchronizing the state of the network for the given miner or validator.
         """
-        # Ensure miner or validator hotkey is still registered on the network.
-        self.check_registered()
+        # Registration checks hit RPC; keep them inside try so transient websocket timeouts
+        # do not bubble up and kill the miner background thread (axon would keep running
+        # without metagraph refresh).
+        try:
+            self.check_registered()
+        except Exception:
+            bt.logging.error(
+                "Couldn't verify hotkey registration (RPC error). Will retry after backoff.\n"
+                + traceback.format_exc()
+            )
+            bt.logging.error(
+                "If this persists, use a more reliable subtensor endpoint (local node or alternate Finney RPC)."
+            )
+            time.sleep(5)
+            return
 
         try:
             if self.should_sync_metagraph():
